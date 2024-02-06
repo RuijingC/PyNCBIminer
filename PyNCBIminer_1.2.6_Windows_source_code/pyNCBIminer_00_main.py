@@ -1,22 +1,31 @@
 # *-* coding:utf-8 *-*
 # @Time:2022/5/6 15:14
-# @Author:
-# @File:pyNCBIminer_00_main.py.py
+# @Author: Ruijing Cheng
+# @File:pyNCBIminer_00_main.py
 # @Software:PyCharm
 
 
 import os
 import sys
-# from pyNCBIminer_02_ui import Ui_MainWindow
-from pyNCBIminer_01_tools import print_line, format_entrez_query, entrez_count, iterated_blast_main, my_concatenation, \
-    filter_by_length, mafft, trimal, iqtree, install_mafft, install_trimal
-from PySide2.QtWidgets import QApplication, QMessageBox, QFileDialog, QMainWindow  # , QDesktopWidget
+from ui_main import Ui_MainWindow
+from PySide2.QtWidgets import QApplication, QMessageBox, QFileDialog, QMainWindow
 from PySide2.QtUiTools import QUiLoader
 from PySide2.QtCore import QObject, Signal, QEventLoop, QTimer, Slot, SIGNAL
-from PySide2.QtGui import QTextCursor, QFont
+from PySide2.QtGui import QTextCursor
 from pathlib import Path
 import threading
 from miner_filter import Miner_filter
+from my_filter import call_miner_filter
+from tools import print_line
+from install_dependencies import install_mafft, install_trimal
+from call_mafft2 import mafft
+from call_trimal import trimal
+from my_concatenation import my_concatenation
+from iterated_blast import iterated_blast_main
+from my_entrez import format_entrez_query, entrez_count
+import warnings
+
+warnings.filterwarnings('ignore')
 
 
 class EmittingStr(QObject):
@@ -53,11 +62,13 @@ class MainWindow(QMainWindow):
         self.ui.message_box.ensureCursorVisible()
 
     def __init__(self):
-        # load ui file
-        self.ui = QUiLoader().load('ui/PyNCBIminer_main8.ui')
-        # super(MainWindow, self).__init__()
-        # self.ui = Ui_MainWindow()
-        # self.ui.setupUi(self)
+        # use uiloader
+        # self.ui = QUiLoader().load('ui/PyNCBIminer_main9.ui')
+
+        # use ui_main.py
+        super(MainWindow, self).__init__()
+        self.ui = Ui_MainWindow()
+        self.ui.setupUi(self)
 
         # resize the window
         screen = QApplication.desktop()
@@ -82,7 +93,7 @@ class MainWindow(QMainWindow):
 
         self.ui.target_region.setEditable(True)
         self.ui.set_target_region.setEnabled(False)
-        target_region_list = os.listdir(Path("parameters"))
+        target_region_list = os.listdir(Path("blast_parameters"))
         target_region_list = [Path(x).stem for x in target_region_list]
         self.ui.target_region.clear()
         self.ui.target_region.addItems([""] + target_region_list)
@@ -90,10 +101,16 @@ class MainWindow(QMainWindow):
 
         self.ui.save_settings.clicked.connect(self.save_settings)
 
+        self.ui.len_threshold.setEnabled(False)
+        # self.ui.name_correction.setEnabled(False)
+        self.ui.reduce_dataset.stateChanged.connect(self.set_reduce_threshold)
+        self.ui.out_path1.setEnabled(False)
+        self.ui.view_out_path1.setEnabled(False)
+
         self.ui.ali_alg.setEditable(False)
 
-        # todo: 目前只允许选择一个选项，等最后流程确定了，可以选择多个步骤顺序进行
-        # self.ui.buttonGroup_4.setExclusive(False)
+        # allow to do control extension, then reduce dataset
+        self.ui.buttonGroup.setExclusive(False)
 
         self.ui.tri_met.setEditable(False)
         self.ui.tri_gt.setEnabled(False)
@@ -130,8 +147,8 @@ class MainWindow(QMainWindow):
         # redirect the output messages to the message box
         sys.stdout = EmittingStr()
         self.ui.message_box.connect(sys.stdout, SIGNAL("textWritten(QString)"), self.outputWritten)
-        # sys.stderr = EmittingStr()
-        # self.ui.message_box.connect(sys.stderr, SIGNAL("textWritten(QString)"), self.outputWritten)
+        sys.stderr = EmittingStr()
+        self.ui.message_box.connect(sys.stderr, SIGNAL("textWritten(QString)"), self.outputWritten)
 
         # --------------------------------- Tools ---------------------------------
         root_path = os.getcwd()
@@ -272,7 +289,7 @@ class MainWindow(QMainWindow):
             return
 
         parameters_dict = {}
-        with open(Path("parameters") / Path(target_region + ".txt"), "r") as fr:
+        with open(Path("blast_parameters") / Path(target_region + ".txt"), "r") as fr:
             parameters = fr.read().splitlines()
             for parameter in parameters:
                 if parameter.strip() != "":
@@ -329,7 +346,7 @@ class MainWindow(QMainWindow):
         nucl_reward = self.ui.nucl_reward.text().strip()
         nucl_penalty = self.ui.nucl_penalty.text().strip()
 
-        with open(Path("parameters") / Path(target_region + ".txt"), "w") as fw:
+        with open(Path("blast_parameters") / Path(target_region + ".txt"), "w") as fw:
             fw.write("target_region\t" + target_region + "\n")
             fw.write("entrez_qualifier\t" + entrez_qualifier + "\n")
             fw.write("max_length\t" + str(max_length) + "\n")
@@ -627,7 +644,7 @@ class MainWindow(QMainWindow):
 
         # show parameters in the Sequence Retrieving panel
         # target_region_list = ["ITS", "rbcL", "matK", "trnL-trnF", "psbA-trnH", "ndhF", "rpoB"]
-        target_region_list = os.listdir(Path("parameters"))
+        target_region_list = os.listdir(Path("blast_parameters"))
         target_region_list = [Path(x).stem for x in target_region_list]
         if target_region in target_region_list:
             target_region_list.remove(target_region)
@@ -689,17 +706,18 @@ class MainWindow(QMainWindow):
     # -------------------------------- Supermatrix Construction ----------------------------------
     # view input path and output path of Sequence Filtering
     def view_in_path1(self):
-        if self.ui.buttonGroup.checkedButton().text() == "Remove exceptional records":
-            path = QFileDialog.getOpenFileName(self.ui, "select file path", r"D:\\", "file type (*.fasta *.fas *.fa)")
-            self.ui.in_path1.setText(path[0])
-        elif self.ui.buttonGroup.checkedButton().text() == "Combine species":
-            path = QFileDialog.getOpenFileName(self.ui, "select file path", r"D:\\", "file type (*.fasta *.fas *.fa)")
-            self.ui.in_path1.setText(path[0])
-        else:
-            path = QFileDialog.getExistingDirectory(self.ui, "select file path", r"D:\\")
-            self.ui.in_path1.setText(path)
-        # path = QFileDialog.getExistingDirectory(self.ui, "select file path", r"D:\\")
-        # self.ui.in_path1.setText(path)
+        # if self.ui.buttonGroup.checkedButton().text() == "Remove exceptional records":
+        #     path = QFileDialog.getOpenFileName(self.ui, "select file path", r"D:\\", "file type (*.fasta *.fas *.fa)")
+        #     self.ui.in_path1.setText(path[0])
+        # elif self.ui.buttonGroup.checkedButton().text() == "Combine species":
+        #     path = QFileDialog.getOpenFileName(self.ui, "select file path", r"D:\\", "file type (*.fasta *.fas *.fa)")
+        #     self.ui.in_path1.setText(path[0])
+        # else:
+        #     path = QFileDialog.getExistingDirectory(self.ui, "select file path", r"D:\\")
+        #     self.ui.in_path1.setText(path)
+        path = QFileDialog.getExistingDirectory(self.ui, "select file path", r"D:\\")
+        self.ui.in_path1.setText(path)
+
 
     def view_out_path1(self):
         path = QFileDialog.getExistingDirectory(self.ui, "select file path", r"D:\\")
@@ -745,61 +763,50 @@ class MainWindow(QMainWindow):
                                            "file type (*.fasta *.fas *.fa *.phylip *.phy)")
         self.ui.in_path5.setText(path[0])
 
-    # def view_out_path5(self):
-    #     path = QFileDialog.getExistingDirectory(self.ui, "select file path", r"D:\\")
-    #     self.ui.out_path5.setText(path)
+    def set_reduce_threshold(self):
+        """
 
-    def view_partition_file(self):
-        path = QFileDialog.getOpenFileName(self.ui, "select file path", r"D:\\", "file type (*.txt *.nexus)")
-        self.ui.partition_file.setText(path)
-
-    def view_constrain_file(self):
-        path = QFileDialog.getOpenFileName(self.ui, "select file path", r"D:\\", "file type (*.txt *.nexus)")
-        self.ui.constrain_file.setText(path)
+        :return:
+        """
+        if self.ui.reduce_dataset.isChecked():
+            self.ui.len_threshold.setEnabled(True)
+            # self.ui.name_correction.setEnabled(True)
+        else:
+            self.ui.len_threshold.setEnabled(False)
+            # self.ui.name_correction.setEnabled(False)
 
     def run_filtering2(self):
         in_path1 = self.ui.in_path1.text().strip()
-        out_path1 = self.ui.out_path1.text().strip()
-        if not os.path.exists(out_path1):
-            os.makedirs(out_path1)
-        my_filter = Miner_filter(in_path1, out_path1)
-        if self.ui.control_extension.isChecked():
+        # out_path1 = self.ui.out_path1.text().strip()
+        out_path1 = in_path1
+        len_threshold = int(self.ui.len_threshold.text().strip())
+        # name_correction = eval(self.ui.name_correction.currentText().strip())
+        name_correction = False
+
+        if self.ui.control_extension.isChecked() and self.ui.reduce_dataset.isChecked():
+            print("Control extension and reduce dataset...")
+            action = 3
+            self.ui.thread = threading.Thread(target=call_miner_filter,
+                                              args=(in_path1, out_path1, action, len_threshold, name_correction))
+            self.ui.thread.setDaemon(True)
+            self.ui.thread.start()
+        elif self.ui.control_extension.isChecked():
             print("Control extension...")
-            self.ui.thread = threading.Thread(target=my_filter.control_extension)
+            action = 1  # call_miner_filter(in_path, out_path, action, len_shresh, max_num)
+            self.ui.thread = threading.Thread(target=call_miner_filter,
+                                              args=(in_path1, out_path1, action, len_threshold, name_correction))
             self.ui.thread.setDaemon(True)
             self.ui.thread.start()
         elif self.ui.reduce_dataset.isChecked():
             print("Reduce dataset...")
-            self.ui.thread = threading.Thread(target=my_filter.reduce_dataset, args=(True, True, True, True, 50, True))
+            action = 2
+            self.ui.thread = threading.Thread(target=call_miner_filter,
+                                              args=(in_path1, out_path1, action, len_threshold, name_correction))
             self.ui.thread.setDaemon(True)
             self.ui.thread.start()
-        elif self.ui.remove_exceptional_records.isChecked():
-            print("Remove exceptional records......")
-            self.ui.thread = threading.Thread(target=my_filter.remove_exceptional_records, args=(in_path1, out_path1, True, True, True, True, 50, True))
-            self.ui.thread.setDaemon(True)
-            self.ui.thread.start()
-        elif self.ui.combine_species.isChecked():
-            print("Combine species......")
-            self.ui.thread = threading.Thread(target=my_filter.combine_species, args=(in_path1, out_path1, True, True, True))
-            self.ui.thread.setDaemon(True)
-            self.ui.thread.start()
+
         else:
             print("Please select one option.")                                                
-
-    def run_filtering(self):
-        """
-        connects the running button of Sequence Filtering with the filter_by_length function
-        :return: None
-        """
-        in_path1 = self.ui.in_path1.text().strip()
-        out_path1 = self.ui.out_path1.text().strip()
-        if not os.path.exists(out_path1):
-            os.makedirs(out_path1)
-        self.ui.thread = threading.Thread(target=filter_by_length, args=(in_path1, out_path1))
-        print("Running filtering...")
-        self.ui.thread.setDaemon(True)
-        self.ui.thread.start()
-        # yiyang.format_wizard.filter_by_length(in_path=in_path1, out_path=out_path1)
 
     def run_alignment(self):
         """
@@ -917,51 +924,21 @@ class MainWindow(QMainWindow):
         self.ui.thread.setDaemon(True)
         self.ui.thread.start()
 
-    def run_iqtree(self):
-        """
-        connects the running button of Maximum Likelihood Inference with the call_iqtree function
-        :return: None
-        """
-        in_path5 = self.ui.in_path5.text().strip()
-        # out_path5 = self.ui.out_path5.text().strip()
-
-        # if not os.path.exists(out_path5):
-        #     os.makedirs(out_path5)
-        bootstrap = self.ui.bootstrap.currentText().strip()
-        bootstrap_number = self.ui.bootstrap_number.text().strip()
-        threads = self.ui.threads.text().strip()
-        iteration_number = self.ui.iteration_number.text().strip()
-        redo = eval(self.ui.redo.currentText().strip())
-        partition_file = self.ui.partition_file.text().strip()
-        constrain_file = self.ui.constrain_file.text().strip()
-        ml_add_par = self.ui.ml_add_par.text().strip()
-        ml_mod = eval(self.ui.ml_mod.currentText().strip())
-        ml_cmd = self.ui.ml_cmd.toPlainText().strip()
-        out_path5 = "./"
-        self.ui.thread = threading.Thread(target=iqtree, args=(in_path5, out_path5,
-                                                               bootstrap, bootstrap_number, threads,
-                                                               partition_file, iteration_number,
-                                                               constrain_file, redo, ml_add_par,
-                                                               ml_mod, ml_cmd))
-        print("Running IQ-Tree...")
-        self.ui.thread.setDaemon(True)
-        self.ui.thread.start()
-
 
 if __name__ == "__main__":
-
    # todo: print cannot show?
     # (_OLD_VIRTUAL_PATH)
     # root_path = os.path.abspath(os.path.dirname(__file__))  # running dir
 
     app = QApplication([])
     main_window = MainWindow()
-    main_window.ui.show()
+    main_window.show()
     sys.exit(app.exec_())
 
+    # use uiload
     # app = QApplication([])
     # main_window = MainWindow()
-    # main_window.show()
+    # main_window.ui.show()
     # sys.exit(app.exec_())
 
 

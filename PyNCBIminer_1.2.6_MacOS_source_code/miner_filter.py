@@ -21,15 +21,14 @@ class Miner_filter:
         3. <func> remove_exceptional_records: remove specific records (sp., cf., aff., x, and short ones)
         4. <func> reduce_dataset: select best marker for each taxon.
         
-        
     Public:
         <func> Miner_filter - construction method
         <func> control_extension: control the extension of all seqs, trim if necessary.
         <func> combine_species: combine specific records to corresponding species (subsp., var., f.)
         <func> remove_exceptional_records: remove specific records (sp., cf., aff., x, and short ones)
         <func> reduce_dataset: select best marker for each taxon.
-        
-        <func> get_consensus_dicta: "get method" to get taxa consensus dict
+        <func> tnrs_name_correction: to correct names of organisms based on tnrs (or rTNRS)
+        <func> get_consensus_dict: "get method" to get taxa consensus dict
         
     Private:
         <attr> in_path - input path of this class, usually the output (working directory) of "retrived sequences"
@@ -58,12 +57,12 @@ class Miner_filter:
         <func> calculate_consensus_dict - calculate consensus sequence for each taxon and store to a dictionary
         <func> count_num_query - count the number of sequences in the first query
         <func> align_long_seq - align sequences from the blast_result_long (chosen ones) using --add (NOT IN USE)
-        <func> get_long_seq - get [max_num] most longest sequence of each taxon and save
+        <func> evaluate_seq - evaluate each sequence for representative selecton
         <func> select_seqs_to_keep - select sequences from each taxon according to 3 criteria and write into tsv
         <func> save_selected_seqs - save only the selected sequences into fasta according to the saved csv     
         """
     
-    def __init__(self, in_path, out_path):
+    def __init__(self, in_path, out_path, DEBUG_MODE=False):
         """ construction and method
         ----------
         Parameters
@@ -79,6 +78,7 @@ class Miner_filter:
         self.__quality_control_max_size_subset = 0
         self.__nt_calculator = nt_Calculator()
         self.__taxa_consensus_dict = {} # {"Magnolia coco": "AATTCCGG", "taxon 2": "AATCGCCTT", ...}
+        self.DEBUG_MODE = DEBUG_MODE
         
         files = ["blast_results_non_duplicate.fasta",
                  "blast_results_exception_removed.fasta",
@@ -96,8 +96,7 @@ class Miner_filter:
                     file_time = time.strftime("%Y-%m-%d.%H.%M'.%S''", file_time)
                     backup_folder = os.path.join(backup_folder, file_time)
                     create_folder(backup_folder)
-                shutil.move(os.path.join(out_path,"results",file), os.path.join(backup_folder, file))
-        
+                    shutil.move(os.path.join(out_path,"results",file), os.path.join(backup_folder, file))
         
         tmp_files = ["consensus_calculation",
                      "blast_result_kept.txt",
@@ -113,6 +112,38 @@ class Miner_filter:
                         os.remove(path)
                 except:
                     pass
+                
+    def tnrs_name_correction(self):
+        """ Main author: Yuxuan Wang, Yang Yi
+            to correct names of organisms based on tnrs (or rTNRS), original file will be back up as seq_info_ori.txt
+            dependencies required: folder 'TNRS_dep' should be placed in the same path with this script (miner_filter.py)
+        """
+        if "R_HOME" not in os.environ:
+            os.environ["R_HOME"] = "./TNRS_dep"
+        import rpy2.robjects as ro
+        from rpy2.robjects.packages import importr
+        from rpy2.robjects import pandas2ri
+        from rpy2.robjects.conversion import localconverter
+        
+        pandas2ri.activate()
+        tnrs = importr("TNRS")
+        blast_info_path = os.path.join(self.__in_path,"results","blast_results_checked_seq_info.txt")
+        df = pd.read_table(blast_info_path)
+        df_main_info = df[['accession', 'organism']]
+        result = tnrs.TNRS(df_main_info, sources="wcvp", classification="wfo", mode="resolve", matches="best", skip_internet_check=True)
+        with localconverter(ro.default_converter + pandas2ri.converter):
+            pdf = ro.conversion.rpy2py(result)
+        pdf_selected = pdf.iloc[:, [1,32,33,34,37,40]]
+        pdf_selected.to_csv(os.path.join(self.__tmp_path,'temp_TNRS.txt'), index=False, sep='\t')
+        dfc = pd.merge(df, pdf_selected, left_on='organism', right_on='Name_submitted', how='left')
+        dfc.rename(columns={'organism': 'organism_ori', 'Accepted_name': 'organism'}, inplace=True)
+        
+        out_path = os.path.join(self.__out_path,"results","blast_results_checked_seq_info.txt")
+        if os.path.isfile(out_path):
+            shutil.move(out_path, 
+                        out_path.replace("blast_results_checked_seq_info.txt","blast_results_checked_seq_info_ori.txt"))
+        dfc.to_csv(out_path, index=False, sep='\t')
+
         
     def remove_exceptional_records(self, in_path=None, out_path=None,
                                    sp=True, cf=True, aff=True, x=True, 
@@ -146,7 +177,8 @@ class Miner_filter:
         else:
             this_out_path = os.path.join(self.__out_path, "results")
         
-        df_records_info = pd.read_csv(os.path.join(self.__in_path, "results", self.__get_info_csv()), sep="\t")
+        df_path = os.path.join(self.__in_path, "results", self.__get_info_csv())
+        df_records_info = pd.read_csv(df_path, sep="\t")
         out_file_name = "blast_results_exception_removed.fasta"
         
         ## STEP 2: set special tokens to be removed
@@ -173,6 +205,9 @@ class Miner_filter:
             
             accession = record.description.split("|")[0].split(":")[0]
             organism = list(df_records_info.loc[df_records_info["accession"]==accession]["organism"])[0]
+            if not isinstance(organism, str):
+                continue
+            
             organism = organism.replace(" ", "_")
             if any([banned_word in organism for banned_word in remove_list]):
                 continue
@@ -183,6 +218,10 @@ class Miner_filter:
         
         out_fasta = os.path.join(this_out_path, out_file_name)
         SeqIO.write(filtered_records, out_fasta, "fasta")
+        
+        df_records_info.dropna(subset=["organism"], inplace=True)
+        df_records_info.to_csv(df_path, index=False, sep="\t")
+        
     
     def combine_species(self, subsp=True, var=True, f=True):
         """ combine specific records(subsp, var, f) into their species 
@@ -214,6 +253,9 @@ class Miner_filter:
         ## STEP 3: modify the info csv (blast_results_checked_seq_info.txt)
         for i in df_records_info.index:
             for word in combine_list:
+                if not isinstance(df_records_info["organism"][i], str):
+                    df_records_info.drop(i, axis=0, inplace=True)
+                    break
                 if word in df_records_info["organism"][i]:
                     organism = df_records_info["organism"][i]
                     organism = organism[:organism.index(word)]
@@ -223,9 +265,11 @@ class Miner_filter:
         df_records_info.to_csv(csv_out_path, sep="\t", index=False)
 
     def reduce_dataset(self,
+                       name_correction=False,  # for name correction using tnrs (rtnrs)
                        subsp=True, var=True, f=True,  # for species combination
                        sp=True, cf=True, aff=True, x=True, length_threshold=0, ignore_gap=True,  # for exception removal
-                       max_num=10):  # for dataset reduction
+                       max_insertion_length=20, max_insertion_num=1  # for deletion of large inserted fragment
+                       ):
         """ to reduce the dataset by select the best representative sequence for each taxon
         ----------
         Parameters
@@ -236,13 +280,15 @@ class Miner_filter:
         - length_threshold - sequences shorter than this value will be remobved
         - ignore_gap - if True, gaps will be ignored when counting lengths of sequences
         """
-        self.combine_species(subsp=subsp, var=var, f=f)
-        self.remove_duplicate()
+        if name_correction:
+            self.tnrs_name_correction()
+        print("Filtering... turn to tmp_files/consensus_calculation for approximate progress")
         self.remove_exceptional_records(sp=sp, cf=cf, aff=aff, x=x, 
                                         length_threshold=length_threshold, ignore_gap=ignore_gap)
-        self.__calculate_consensus_dict()
-        self.__count_num_query()  # count the number of sequences in the first query
-        self.__get_long_seq(max_num=max_num)  # may need further discussion
+        self.combine_species(subsp=subsp, var=var, f=f)
+        self.remove_duplicate()
+        self.__calculate_consensus_dict(length_threshold=max_insertion_length, taxa_threshold=max_insertion_num)
+        self.__evaluate_seq()  # may need further discussion
         self.__select_seqs_to_keep()
         self.__save_selected_seqs()
         
@@ -253,6 +299,7 @@ class Miner_filter:
         curr_step = "blast_results_non_duplicate.fasta"
         df_records_info = pd.read_csv(os.path.join(self.__in_path, "results", "blast_results_checked_seq_info.txt"), sep="\t")
         record_iter = SeqIO.parse(os.path.join(self.__in_path, "results", self.__get_input_filename(curr_step)),"fasta")
+        df_records_info["specimen_voucher"] = df_records_info["specimen_voucher"].fillna("unknown")
         record_iter = sorted(list(record_iter), 
                              key=lambda record:list(df_records_info
                                                     .loc[df_records_info["accession"]==record.description.split("|")[0].split(":")[0]]
@@ -320,8 +367,8 @@ class Miner_filter:
         existing_files = os.listdir(path)
         files = ["blast_results_checked.fasta",
                  "blast_results_controlled.fasta",
-                 "blast_results_non_duplicate.fasta",
-                 "blast_results_exception_removed.fasta"]
+                 "blast_results_exception_removed.fasta",
+                 "blast_results_non_duplicate.fasta"]
         if not curr_step:
             curr_step = len(files)-1
         else:
@@ -383,7 +430,7 @@ class Miner_filter:
             
         return coverage
     
-    def __calculate_consensus_dict(self):
+    def __calculate_consensus_dict(self, length_threshold=20, taxa_threshold=1):
         """ calculate consensus sequence for each taxon and store to a dictionary
         """
         in_path = os.path.join(self.__in_path, "results")
@@ -414,6 +461,12 @@ class Miner_filter:
             command = f"mafft --auto --thread -1 --reorder {records_path} > {msa_path}"
             os.system(command)
             
+        self.__remove_long_insertion(taxon, length_threshold, taxa_threshold)
+        for taxon in records_grouped.keys():   
+            records = records_grouped[taxon]
+            if len(records) <= 3:
+                continue
+            msa_path = os.path.join(tmp_path, f"{taxon}_msa.fasta")
             consensus_sequence = self.__nt_calculator.get_consensus_sequence(SeqIO.parse(msa_path, "fasta"))
             records_consensus[taxon] = consensus_sequence
             
@@ -446,7 +499,7 @@ class Miner_filter:
         msg = f'in <func> align_long_seq:\n  Long sequences are aligned with MAFFT using command "{command}"'
         self.__logger.write_message(msg)
 
-    def __get_long_seq(self, max_num=10):
+    def __evaluate_seq(self):
         """ get [max_num] most longest sequence of each taxon and save
         ----------
         Parameters
@@ -455,46 +508,13 @@ class Miner_filter:
         ## STEP 1: load blast result
         blast_result = os.path.join(self.__out_path, "results", self.__get_input_filename())
         record_iter = SeqIO.parse(blast_result, "fasta")
-        records = {}
         df_records_info = pd.read_csv(os.path.join(self.__in_path, "results", self.__get_info_csv()), sep="\t")
-        
-        ## STEP 2: get length of each sequence (wobbles removed) grouped by taxa
-        for record in record_iter:
-            accession = record.description.split("|")[0].split(":")[0]
-            organism = list(df_records_info.loc[df_records_info["accession"]==accession]["organism"])[0]
-            organism = organism.replace(" ", "_")
-            seq_length = self.__get_length_without_wobble(record)
-            records.setdefault(organism, {})
-            records[organism][accession] = seq_length
-            
-        ## STEP 3: keep at most 5 accession numbers for each taxon (keep longest several seqs)
-        for key, value in records.items(): # each value is a dict itself
-            if len(value) > max_num:
-                sorted_list = sorted(value.items(), key=lambda x: -x[1])  # default is ascd
-                value = dict(sorted_list[:max_num])
-                records[key] = value
-                
-        ## STEP 4: get long seqs according to accession numbers kept
-        accession_numbers = list(map(lambda x: list(x.keys()), records.values()))
-        accession_numbers = reduce(add, accession_numbers)
 
-        long_records = []
-        record_iter = SeqIO.parse(blast_result, "fasta")
-        for record in record_iter:
-            record_acc = record.description.split("|")[0].split(":")[0]
-            if record_acc in accession_numbers:
-                long_records.append(record)
-        
-        ## STEP 5: write into temp file
-        filename = "blast_result_long.fasta"
-        SeqIO.write(long_records, os.path.join(self.__tmp_path, filename), "fasta")
-        
         ## STEP 6: store information of records chosen
         # substep 1: get info (that will be used for filtering) from original blast result text file
         blast_result_txt = os.path.join(self.__in_path, "results/blast_results.txt")
         df_blast_info = pd.read_csv(blast_result_txt, sep="\t", 
                                     usecols=["subject_acc.ver", "sum_hits_score", "Source"])
-        df_blast_info = df_blast_info.loc[df_blast_info["subject_acc.ver"].isin(accession_numbers)]
         
         seq_info_txt = os.path.join(self.__in_path, "results/blast_results_checked_seq_info.txt")
         df_seq_info = pd.read_csv(seq_info_txt, sep="\t",
@@ -524,7 +544,10 @@ class Miner_filter:
                     curr_taxon = organism
                 aligned_record = [record for record in aligned_record_iter 
                                   if record.description.split("|")[0].split(":")[0] == subject_acc_ver][0]
-                consensus_value = self.__nt_calculator.calculate_PI(aligned_record, self.__taxa_consensus_dict[organism])
+                consensus_value = self.__nt_calculator.calculate_PI(aligned_record,
+                                                                    self.__taxa_consensus_dict[organism],
+                                                                    [0,len(aligned_record[0])],
+                                                                    [0,len(aligned_record[0])])
             
             else:
                 consensus_value = -1
@@ -541,9 +564,6 @@ class Miner_filter:
         df_blast_info.to_csv(os.path.join(self.__tmp_path, "blast_result_long.txt"),
                              index=False, sep="\t")
         
-        # substep 4: write log file
-        msg = f"in <func> get_long_seq:\n  Longest {max_num} sequences for each taxon identified, see tmp_files/blast_result_long"
-        self.__logger.write_message(msg)
     
     def __select_seqs_to_keep(self, voucher_info_required=1, publish_required=2, newest=3):
         """ select sequences from each taxon according to all criteria and write into tsv
@@ -557,6 +577,7 @@ class Miner_filter:
         ## STEP 1: load input parameter
         blast_result_long_txt = os.path.join(self.__tmp_path, "blast_result_long.txt")
         df = pd.read_csv(blast_result_long_txt, sep="\t")
+        df["specimen_voucher"] = df["specimen_voucher"].fillna("unknown")
         creteria = {"date":newest, "journal":publish_required,"specimen_voucher":voucher_info_required}
         creteria = dict(sorted(creteria.items(), key=lambda item: item[1])) # sort by dict.values()
         for key, value in creteria.items():
@@ -583,9 +604,11 @@ class Miner_filter:
                    
         
         ## STEP 2: for each sequence, get rank of non_gap_length, sum_hits_score, source
+        """
         column_order = ["subject_acc.ver", "taxon_name", "date", "journal", "specimen_voucher",
                         "consensus_value", "sum_hits_score", "Source", "record_length",
-                        "Rank_sum_hits_score", "Rank_source", "Rank_record_length", "Sum_of_rank"]
+                        "Rank_sum_hits_score", "Rank_source", "Rank_record_length", "Sum_of_rank"]"""
+        
         df["Rank_sum_hits_score"] = df["sum_hits_score"].rank(ascending=False, method="average")
         df["Rank_source"] = df["Source"].rank(ascending=True, method="average")
         df["Rank_record_length"] = df["record_length"].rank(ascending=False, method="average")
@@ -634,6 +657,15 @@ class Miner_filter:
         df.to_csv(blast_result_kept_txt, sep="\t", index=False)
         blast_result_kept_txt = os.path.join(self.__out_path, "results", "blast_result_kept.txt")
         df.to_csv(blast_result_kept_txt, sep="\t", index=False)
+        
+    def __remove_long_insertion(self, taxon, length_threshold=20, taxa_threshold=1):
+        consensus_calculation_folder = os.path.join(self.__tmp_path, "consensus_calculation")
+        for file in os.listdir(consensus_calculation_folder):
+            if file.endswith("_msa.fasta"):        
+                self.__nt_calculator.remove_minor_large_insertion(os.path.join(consensus_calculation_folder,file),
+                                                                  length_threshold=length_threshold,
+                                                                  taxa_threshold=taxa_threshold,
+                                                                  keep_tmp=self.DEBUG_MODE)
         
     @staticmethod
     def __filter_on_voucher_info(df):
@@ -1048,18 +1080,20 @@ if __name__ == "__main__":
     
     def debug_reduce_dataset(path):
         try:
-            my_filter = Miner_filter(path, path)
+            my_filter = Miner_filter(path, path, DEBUG_MODE=True)
             my_filter.reduce_dataset(subsp=True, var=True, f=True,  # for species combination
-                                     sp=True, cf=True, aff=True, x=True, length_threshold=0, ignore_gap=True)
+                                     sp=True, cf=True, aff=True, x=True, length_threshold=0, ignore_gap=True,
+                                     max_insertion_length=40, max_insertion_num=2)
         except:
             with open((f"{path}/BUG_log.txt"),"w") as f:
                 f.write(str(traceback.format_exc()))
                 
-    path1 = "C:/Users/Yy/学习资料/Project/pyNCBIminer/开发数据/Magnoliaceae/LEAFY"
-    path2 = "C:/Users/Yy/学习资料/Project/pyNCBIminer/开发数据/Asterales/rbcL_20230412"      
-    path3 = "C:/Users/Yy/学习资料/Project/pyNCBIminer/开发数据/Asterales/ITS_20230412"
+    path1 = "C:/Users/Yy/学习资料/Project/pyNCBIminer/开发数据/Magnoliaceae/GAI1"
+    path2 = "C:/Users/Yy/学习资料/Project/pyNCBIminer/开发数据/Asterales/rbcL_20230412"   # 13881 seqs    
+    path3 = "C:/Users/Yy/学习资料/Project/pyNCBIminer/开发数据/Asterales/ITS_20230412"  # 40000+ seqs
     path4 = "C:/Users/Yy/学习资料/Project/pyNCBIminer/开发数据/Dipsacales/rbcL_20180820_Dipsacales"
-    debug_reduce_dataset(path4)
+    path5 = r"C:\Users\Yy\Desktop\ndhI"
+    debug_reduce_dataset(path5)
 
     
     """
